@@ -1,0 +1,3 @@
+# Optional: richer article extraction in fetch_url. Pulls lxml; on Termux build from source is heavy — skip
+# unless you install libxml/libxsl toolchain (see Termux issue threads for pip install lxml).
+trafilatura

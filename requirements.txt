@@ -1,6 +1,5 @@
 python-telegram-bot
 python-dotenv
 requests
-trafilatura
 google-auth
 google-api-python-client

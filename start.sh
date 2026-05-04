@@ -26,6 +26,11 @@ source .venv/bin/activate
 pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
+# Optional: trafilatura pulls lxml (needs libxml2/libxslt builds on Termux). fetch_url falls back without it.
+if ! pip install -q -r requirements-extract.txt 2>/dev/null; then
+  echo "Note: optional trafilatura not installed — fetch_url uses basic HTML stripping (normal on Termux)."
+fi
+
 # ddgs is optional: web search uses DuckDuckGo HTML via requests when ddgs is not installed (e.g. Termux).
 if ! pip install -q -r requirements-websearch.txt 2>/dev/null; then
   echo "Note: optional ddgs not installed — HTML search fallback is used (this is fine on Termux)."
