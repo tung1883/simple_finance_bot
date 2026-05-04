@@ -118,12 +118,16 @@ python dev_run.py
 
 ```bash
 pkg update
-pkg install python git
+pkg install python git python-cryptography
 git clone <repo-url>
 cd personal_finance_bot
 chmod +x start.sh
 ./start.sh
 ```
+
+**Why `python-cryptography`:** transitive dependencies eventually want **`cryptography`**, which bundles **Rust**. Building it with **`pip`** on Android often stops at **“metadata generation failed”**. Termux ships **`python-cryptography`** (`pkg`) so **`start.sh`** can create a **`--system-site-packages`** virtualenv that **reuses** that build instead of compiling.
+
+If you hit metadata/cryptography errors after an older checkout, **`rm -rf .venv`** and **`./start.sh`** again once **`pkg install python-cryptography`** has been run.
 
 Use **`tmux`** if you want the session to stay running when you disconnect. Give Termux **storage access** if the service account JSON lives under **`Download`**. Android may stop background processes; set **Termux** to **unrestricted** battery where possible if the bot should run 24/7.
 

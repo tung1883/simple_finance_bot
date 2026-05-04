@@ -17,13 +17,29 @@ command -v "$PY" >/dev/null 2>&1 || PY="python"
 
 if [ ! -d .venv ]; then
   echo "Creating virtual env in .venv …"
-  "$PY" -m venv .venv
+  # Termux: cryptography (Rust) builds from pip fail — use pkg install python-cryptography + inherited site-packages.
+  if [ -n "${TERMUX_VERSION:-}" ]; then
+    "$PY" -m venv --system-site-packages .venv
+  else
+    "$PY" -m venv .venv
+  fi
 fi
 
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-pip install -q --upgrade pip
+pip install -q --upgrade pip setuptools wheel
+
+if [ -n "${TERMUX_VERSION:-}" ]; then
+  if ! python -c "import cryptography" 2>/dev/null; then
+    echo "Termux needs the prebuilt cryptography module (pip cannot build metadata here):"
+    echo "  pkg install python-cryptography"
+    echo "Then recreate this venv so it inherits it:"
+    echo "  rm -rf .venv && ./start.sh"
+    exit 1
+  fi
+fi
+
 pip install -q -r requirements.txt
 
 # Optional: trafilatura pulls lxml (needs libxml2/libxslt builds on Termux). fetch_url falls back without it.
