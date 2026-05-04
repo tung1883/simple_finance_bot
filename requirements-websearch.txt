@@ -1,0 +1,2 @@
+# Optional: same search as built-in HTML fallback, via ddgs (native); Termux usually skips this.
+ddgs

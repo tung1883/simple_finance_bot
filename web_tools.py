@@ -1,20 +1,26 @@
 """
-Web tools for the finance coach: DuckDuckGo-backed search (`ddgs`) and guarded HTTP fetch + extract.
+Web tools for the finance coach: DuckDuckGo-backed search and guarded HTTP fetch + extract.
+
+Search uses `ddgs` when installed; otherwise (or on failure) the HTML endpoint via `requests`, which
+works on Termux without native primp wheels.
 
 Env:
   WEB_SEARCH_ENABLED — default on; false/0/off disables search.
   WEB_SEARCH_MAX_RESULTS — default 5, max 15.
+  WEB_SEARCH_TIMEOUT_SEC — default 25 (HTML fallback and overall search).
+  WEB_SEARCH_USER_AGENT — optional identity for HTML search POST.
   WEB_FETCH_ENABLED — default on; false disables fetch_url.
   WEB_FETCH_TIMEOUT_SEC — default 15.
   WEB_FETCH_MAX_BYTES — default 2_000_000 download cap.
   WEB_FETCH_MAX_CHARS — default 12000 text passed back to the model.
 """
+import html as html_module
 import ipaddress
 import os
 import re
 import socket
-from typing import Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 
@@ -86,36 +92,86 @@ def _resolved_ips_blocked(hostname: str) -> Tuple[bool, str]:
     return False, ""
 
 
-def run_web_search(query: str) -> str:
-    if not web_search_enabled():
-        return "Web search is turned off (WEB_SEARCH_ENABLED)."
+def _env_search_timeout() -> int:
+    return _env_int("WEB_SEARCH_TIMEOUT_SEC", 25, 10, 60)
 
-    q = (query or "").strip()
-    if not q:
-        return "web_search: empty query — pass keywords or a question in the tool query field."
 
-    max_r = _env_int("WEB_SEARCH_MAX_RESULTS", 5, 1, 15)
+def _strip_tags(s: str) -> str:
+    if not s:
+        return ""
+    t = re.sub(r"<[^>]+>", " ", s)
+    t = html_module.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()
 
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        return (
-            "Web search is not installed. Add dependency: ddgs "
-            "(pip install ddgs — see requirements.txt)."
+
+def _unwrap_ddg_redirect(href: str) -> str:
+    if not href or not href.startswith("http"):
+        return href
+    host = (urlparse(href).hostname or "").lower()
+    if "duckduckgo.com" not in host:
+        return href
+    qs = parse_qs(urlparse(href).query)
+    for key in ("uddg", "u3"):
+        if key in qs and qs[key]:
+            return unquote(qs[key][0]).strip()
+    return href
+
+
+def _ddg_html_text_results(query: str, max_results: int) -> List[dict[str, Any]]:
+    """DuckDuckGo HTML endpoint + stdlib/regex parsing (no ddgs/primp)."""
+    url = "https://html.duckduckgo.com/html/"
+    ua = os.getenv(
+        "WEB_SEARCH_USER_AGENT",
+        "Mozilla/5.0 (compatible; CashButlerFinanceBot/1.0; +https://github.com/)",
+    ).strip()
+    r = requests.post(
+        url,
+        data={"q": query, "b": ""},
+        headers={"User-Agent": ua},
+        timeout=_env_search_timeout(),
+    )
+    r.raise_for_status()
+    page = r.text
+    marker = "results_links_deep web-result"
+    if marker not in page:
+        return []
+
+    parts = page.split(marker)
+    rows: List[dict[str, Any]] = []
+    for chunk in parts[1:]:
+        if "result--ad" in chunk[:500]:
+            continue
+        tm = re.search(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            chunk,
+            re.DOTALL | re.IGNORECASE,
         )
+        if not tm:
+            continue
+        href_raw = (tm.group(1) or "").strip()
+        title_html = tm.group(2) or ""
+        sm = re.search(
+            r'class="result__snippet"[^>]*href="[^"]*"[^>]*>(.*?)</a>',
+            chunk,
+            re.DOTALL | re.IGNORECASE,
+        )
+        body_html = sm.group(1) if sm else ""
+        href = _unwrap_ddg_redirect(href_raw)
+        rows.append(
+            {
+                "title": _strip_tags(title_html),
+                "href": href,
+                "body": _strip_tags(body_html),
+            }
+        )
+        if len(rows) >= max_results:
+            break
+    return rows
 
-    try:
-        with DDGS() as ddgs:
-            raw = ddgs.text(q, max_results=max_r)
-            results = list(raw) if raw else []
-    except Exception as e:
-        return f"Web search request failed ({type(e).__name__}): {e}"
 
-    if not results:
-        return f"No web results returned for: {q}"
-
+def _format_search_lines(query: str, results: List[dict[str, Any]]) -> str:
     lines = [
-        f"Web search results for query: {q}",
+        f"Web search results for query: {query}",
         "(Snippets — verify on source pages; dates may be missing.)\n",
     ]
     for i, r in enumerate(results, 1):
@@ -129,6 +185,42 @@ def run_web_search(query: str) -> str:
             lines.append(f"   {body}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def run_web_search(query: str) -> str:
+    if not web_search_enabled():
+        return "Web search is turned off (WEB_SEARCH_ENABLED)."
+
+    q = (query or "").strip()
+    if not q:
+        return "web_search: empty query — pass keywords or a question in the tool query field."
+
+    max_r = _env_int("WEB_SEARCH_MAX_RESULTS", 5, 1, 15)
+
+    results: List[dict[str, Any]] = []
+    try:
+        from ddgs import DDGS
+
+        with DDGS() as ddgs:
+            raw = ddgs.text(q, max_results=max_r)
+            results = list(raw) if raw else []
+    except ImportError:
+        try:
+            results = _ddg_html_text_results(q, max_r)
+        except Exception as e:
+            return f"Web search failed ({type(e).__name__}): {e}"
+    except Exception as e:
+        try:
+            results = _ddg_html_text_results(q, max_r)
+        except Exception as e2:
+            return (
+                f"Web search request failed ({type(e).__name__}): {e}; "
+                f"HTML fallback: ({type(e2).__name__}): {e2}"
+            )
+
+    if not results:
+        return f"No web results returned for: {q}"
+    return _format_search_lines(q, results)
 
 
 def _normalize_fetch_url(query: str) -> str:
