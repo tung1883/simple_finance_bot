@@ -31,9 +31,13 @@ if ! pip install -q -r requirements-extract.txt 2>/dev/null; then
   echo "Note: optional trafilatura not installed — fetch_url uses basic HTML stripping (normal on Termux)."
 fi
 
-# ddgs is optional: web search uses DuckDuckGo HTML via requests when ddgs is not installed (e.g. Termux).
-if ! pip install -q -r requirements-websearch.txt 2>/dev/null; then
-  echo "Note: optional ddgs not installed — HTML search fallback is used (this is fine on Termux)."
+# ddgs (Rust/primp → maturin) has no workable wheels on Termux/Android; armv8l etc. builds fail outright.
+if [ -n "${TERMUX_VERSION:-}" ]; then
+  echo "Note: skipping ddgs on Termux — coach search uses DuckDuckGo HTML (requests)."
+else
+  if ! pip install -q -r requirements-websearch.txt 2>/dev/null; then
+    echo "Note: optional ddgs not installed — HTML search fallback is used."
+  fi
 fi
 
 if [ ! -f .env ]; then

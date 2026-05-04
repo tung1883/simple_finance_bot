@@ -127,6 +127,8 @@ chmod +x start.sh
 
 Use **`tmux`** if you want the session to stay running when you disconnect. Give Termux **storage access** if the service account JSON lives under **`Download`**. Android may stop background processes; set **Termux** to **unrestricted** battery where possible if the bot should run 24/7.
 
+If **`pip install ddgs`** errors with **`maturin`** and **`unsupported android architecture: armv8l`**, do not try to fix the build — **`armv8l`** is effectively **32-bit ARM userland**, and **`primp`** (used by **`ddgs`**) does not ship wheels for Android. **`start.sh`** skips installing **`ddgs`** under Termux; **web search still works** via the built-in **HTML DuckDuckGo** path. Devices that support it can install **64-bit Termux** (`aarch64`, `uname -m` prints **`aarch64`**) if you prefer a broader ecosystem, but **`ddgs`/`primp` typically still fails on Termux** either way — rely on the HTML fallback here.
+
 ## Security
 
 Do not commit **`.env`**, **`google-service-account.json`**, or real tokens. They are listed in **`.gitignore`**.
