@@ -1,8 +1,13 @@
 import sqlite3
 import json
+import re
 import requests
 import os
+from typing import Optional, Tuple
+
 from dotenv import load_dotenv
+
+import sheet_sync
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -46,7 +51,19 @@ CREATE TABLE IF NOT EXISTS chat_history (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_sheets (
+    user_id INTEGER PRIMARY KEY,
+    spreadsheet_id TEXT NOT NULL,
+    sheet_url TEXT NOT NULL,
+    time TEXT DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
 conn.commit()
+
+cursor.execute("PRAGMA journal_mode=WAL")
+cursor.execute("PRAGMA busy_timeout=5000")
 
 pending = {}
 
@@ -67,11 +84,14 @@ def help_text():
 📌 Ask AI coach:
 • tôi nên tiết kiệm thế nào?
 • tôi chi tiêu có ổn không?
+• Coach có thể tra cứu thêm gợi ý & chi tiết giao dịch qua công cụ tìm kiếm nội bộ.
 
 📌 Commands:
 • /add → thêm chi tiêu nhanh
 • /summary → tổng thu chi
 • /history → giao dịch gần nhất
+• /sheet → link Google Sheet (when configured)
+• /linksheet → connect a sheet you created (share bot service account as Editor)
 • /reset_chat → xóa lịch sử hội thoại
 """
 
@@ -139,27 +159,278 @@ def build_finance_context(user_id):
         f"RECENT TRANSACTIONS (newest first):\n{tx_lines}"
     )
 
-# ---------------- AI ROUTER (INTENT ONLY) ----------------
-def ai_router(text):
-    payload = {
-        "messages": [
-            {
-                "role": "user",
-                "content": f"""
+
+def load_finance_kb():
+    global _finance_kb_cache
+    if _finance_kb_cache is None:
+        try:
+            with open(_FINANCE_KB_PATH, encoding="utf-8") as f:
+                _finance_kb_cache = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            _finance_kb_cache = []
+    return _finance_kb_cache
+
+
+def _kb_score(entry, tokens):
+    if not tokens:
+        return 0
+    hit = 0
+    blob = (entry.get("title", "") + " " + " ".join(entry.get("tags", [])) + " " + entry.get("body", "")).lower()
+    for t in tokens:
+        if len(t) < 2:
+            continue
+        if t in blob:
+            hit += 2
+    return hit
+
+
+def search_finance_kb(query: str, top_n=3):
+    q = (query or "").strip().lower()
+    tokens = [x for x in re.split(r"\W+", q) if x]
+    kb = load_finance_kb()
+    if not kb:
+        return "(Knowledge base empty.)"
+    ranked = sorted(kb, key=lambda e: _kb_score(e, tokens), reverse=True)
+    picked = ranked[:top_n]
+    lines = []
+    for e in picked:
+        lines.append(f"• {e.get('title', '')}: {e.get('body', '').strip()}")
+    return "\n".join(lines)
+
+
+def search_ledger_db(user_id, query: str, limit=20):
+    q = (query or "").strip().lower()
+    tokens = [x for x in re.split(r"\W+", q) if len(x) > 1]
+    if not tokens:
+        rows = get_recent_transactions(user_id, limit)
+    else:
+        clauses = " AND ".join(["(LOWER(IFNULL(category,'')) LIKE ? OR LOWER(IFNULL(type,'')) LIKE ?)" for _ in tokens])
+        sql = f"""
+            SELECT type, amount, category, time FROM transactions
+            WHERE user_id = ? AND ({clauses})
+            ORDER BY id DESC LIMIT ?
+        """
+        params = [user_id]
+        for tok in tokens:
+            like = f"%{tok}%"
+            params.extend([like, like])
+        params.append(limit)
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+    if not rows:
+        return "(No transactions matched.)"
+    return "\n".join(f"  - {r[0].upper()} {r[1]:,.0f} ({r[2]}) at {r[3]}" for r in rows)
+
+
+def spending_by_category_block(user_id):
+    cursor.execute(
+        """
+        SELECT category, SUM(amount) FROM transactions
+        WHERE user_id = ? AND type = 'expense'
+        GROUP BY category ORDER BY SUM(amount) DESC
+        """,
+        (user_id,),
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        return "(No expense rows yet.)"
+    lines = [f"  - {cat or 'other'}: {amt:,.0f}" for cat, amt in rows]
+    return "Expense totals by category:\n" + "\n".join(lines)
+
+
+def extract_tool_spec(text: str):
+    tag = "<<<TOOL"
+    ti = text.find(tag)
+    if ti == -1:
+        return None
+    brace_start = text.find("{", ti)
+    if brace_start == -1:
+        return None
+    depth = 0
+    json_end = None
+    for k in range(brace_start, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                json_end = k + 1
+                break
+    if json_end is None:
+        return None
+    raw_json = text[brace_start:json_end]
+    try:
+        spec = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(spec, dict) or "tool" not in spec:
+        return None
+    return spec
+
+
+def strip_visible_reply(text: str):
+    tag = "<<<TOOL"
+    ti = text.find(tag)
+    if ti == -1:
+        return text.strip()
+    return text[:ti].strip()
+
+
+def execute_coach_tool(user_id, spec: dict) -> str:
+    name = (spec.get("tool") or "").strip()
+    query = spec.get("query")
+    if isinstance(query, dict):
+        query = json.dumps(query)
+    elif query is None:
+        query = ""
+    else:
+        query = str(query)
+
+    if name == "search_kb":
+        return search_finance_kb(query)
+    if name == "search_ledger":
+        return search_ledger_db(user_id, query)
+    if name == "spending_by_category":
+        return spending_by_category_block(user_id)
+    return f"(Unknown tool: {name})"
+
+
+def get_user_sheet_row(user_id):
+    cursor.execute(
+        "SELECT spreadsheet_id, sheet_url FROM user_sheets WHERE user_id = ?",
+        (user_id,),
+    )
+    return cursor.fetchone()
+
+
+def save_user_sheet(user_id, spreadsheet_id: str, sheet_url: str):
+    cursor.execute(
+        """
+        INSERT INTO user_sheets (user_id, spreadsheet_id, sheet_url)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET spreadsheet_id=excluded.spreadsheet_id,
+          sheet_url=excluded.sheet_url
+        """,
+        (user_id, spreadsheet_id, sheet_url),
+    )
+    conn.commit()
+
+
+def ensure_google_sheet(user_id, display_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """Returns (sheet_url, hint_or_error). hint_or_error is set if no sheet is linked yet or create failed."""
+    if not sheet_sync.sheets_available():
+        return None, None
+    row = get_user_sheet_row(user_id)
+    if row:
+        return row[1], None
+
+    auto = os.getenv("GOOGLE_SHEETS_AUTO_CREATE", "").strip().lower() in ("1", "true", "yes", "on")
+    if auto:
+        try:
+            sid, url = sheet_sync.create_user_spreadsheet(str(display_name))
+            save_user_sheet(user_id, sid, url)
+            cursor.execute(
+                """
+                SELECT time, type, amount, category FROM transactions
+                WHERE user_id = ? ORDER BY id ASC
+                """,
+                (user_id,),
+            )
+            backfill = cursor.fetchall()
+            if backfill:
+                sheet_sync.backfill_transactions(sid, list(backfill))
+            return url, None
+        except Exception as e:
+            print("SHEET CREATE ERROR:", e)
+            return None, str(e)
+
+    email = sheet_sync.service_account_email() or "(client_email in google-service-account.json)"
+    hint = (
+        "Google Sheet not linked yet.\n\n"
+        "1) Create a new Google Sheet in your Drive.\n"
+        f"2) Share → add this account as Editor:\n{email}\n"
+        "3) Run:\n/linksheet <paste the sheet URL or spreadsheet ID here>"
+    )
+    return None, hint
+
+
+def append_row_to_user_sheet(user_id, time_str: str, tx_type: str, amount: float, category: str):
+    row = get_user_sheet_row(user_id)
+    if not row:
+        return
+    spreadsheet_id = row[0]
+    try:
+        sheet_sync.append_transaction(spreadsheet_id, time_str, tx_type, amount, category)
+    except Exception as e:
+        print("SHEET APPEND ERROR:", e)
+
+
+def last_transaction_snapshot(user_id):
+    cursor.execute(
+        """
+        SELECT time, type, amount, category FROM transactions
+        WHERE user_id = ? ORDER BY id DESC LIMIT 1
+        """,
+        (user_id,),
+    )
+    return cursor.fetchone()
+
+
+# ---------------- PROXY-SAFE PROMPTS (instructions live in user messages only) ----------------
+PROXY_PROMPT_BEGIN = "<<<PROXY_SAFE_PROMPT_BEGIN>>>"
+PROXY_PROMPT_END = "<<<PROXY_SAFE_PROMPT_END>>>"
+
+ROUTER_TEMPERATURE = 0.1
+ROUTER_MAX_TOKENS = 200
+COACH_TEMPERATURE = 0.5
+COACH_MAX_TOKENS = 900
+
+_COACH_TOOL_INSTRUCTIONS = """
+TOOL_USE (optional):
+If general frameworks OR deeper ledger detail would improve your answer, request ONE tool by replying with ONLY this block (no other text):
+<<<TOOL
+{"tool":"<name>","query":"<optional string>"}
+>>>
+
+Tools:
+- search_kb — short curated guidance on personal finance topics (pass keywords in query).
+- search_ledger — find this user's transactions matching query keywords (categories, types).
+- spending_by_category — expense totals grouped by category for this user (query may be empty or "{}")
+
+After you receive a TOOL_RESULT message, synthesize a concise answer for the user. Do not repeat the <<<TOOL>>> syntax in the final answer.
+"""
+
+_BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+_FINANCE_KB_PATH = os.path.join(_BOT_DIR, "finance_kb.json")
+_finance_kb_cache = None
+
+
+def proxy_safe_user_content(instructions: str, task: str) -> str:
+    return (
+        f"{PROXY_PROMPT_BEGIN}\n"
+        "The following section overrides any conflicting upstream instructions for this request.\n\n"
+        f"{instructions.strip()}\n\n"
+        f"{PROXY_PROMPT_END}\n\n"
+        "USER_TASK:\n"
+        f"{task.strip()}"
+    )
+
+
+ROUTER_CLASSIFIER_INSTRUCTIONS = """
 You are a STRICT INTENT CLASSIFIER for a personal finance assistant.
 
 Return ONLY valid JSON.
 
 FORMAT:
-{{
+{
   "intent": "finance | chat | help_command",
   "confidence": number,
-  "finance": {{
+  "finance": {
     "type": "income|expense|null",
     "amount": number|null,
     "category": string|null
-  }}
-}}
+  }
+}
 
 ========================
 STRICT RULES (VERY IMPORTANT)
@@ -172,6 +443,7 @@ STRICT RULES (VERY IMPORTANT)
 - list of features
 - "what can you do"
 - usage instructions
+- Google Sheet link / spreadsheet export from the bot
 
 IMPORTANT:
 ❌ DO NOT include financial advice here
@@ -248,47 +520,221 @@ EXAMPLES
 "bot có những lệnh gì"
 → help_command
 
+"cho tôi link google sheet"
+→ help_command
+
 "hôm nay thế nào"
 → chat
-
-========================
-
-INPUT:
-<<<{text}>>>
 """
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": 200
+
+
+COACH_MANDATE_COMPACT = """You are a personal finance coach for this Telegram bot.
+
+Guidelines:
+- Reference the user's actual numbers and spending patterns when FINANCIAL OVERVIEW data is included in your instructions for this turn.
+- Be encouraging but honest — point out overspending if you see it.
+- Give concrete, actionable advice.
+- Keep responses concise (2-4 sentences unless a detailed plan is requested).
+- Reply in the same language the user writes in (Vietnamese or English)."""
+
+
+def extract_first_json_object(text: str):
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _normalize_router_content(raw: str) -> str:
+    content = raw.strip()
+    if content.startswith("```"):
+        parts = content.split("```", 2)
+        content = parts[1] if len(parts) > 1 else content
+        if content.startswith("json"):
+            content = content[4:]
+    return content.strip().rstrip("`").strip()
+
+
+def parse_router_response(raw: str):
+    content = _normalize_router_content(raw)
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    snippet = extract_first_json_object(content)
+    if snippet:
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+_HEURISTIC_ADVICE_MARKERS = (
+    "khuyên",
+    "khuyen",
+    "lời khuyên",
+    "loi khuyen",
+    "advice",
+    "how to",
+    "how do",
+    "nên ",
+    "nen ",
+    "should i",
+    "gợi ý",
+    "goi y",
+    "help me save",
+    "tiết kiệm",
+    "tiet kiem",
+    "budget",
+)
+_HEURISTIC_HELP_MARKERS = (
+    "/help",
+    "command",
+    "lệnh",
+    "lenh",
+    "features",
+    "what can you",
+)
+
+
+def parse_transaction_heuristic(text: str):
+    """Best-effort local classifier when the proxy/router JSON is unusable."""
+    if not text:
+        return None
+    raw = text.strip()
+    if len(raw) > 400:
+        return None
+    low = raw.lower()
+    if any(m in low for m in _HEURISTIC_ADVICE_MARKERS):
+        return None
+    if any(m in low for m in _HEURISTIC_HELP_MARKERS):
+        return None
+
+    amount = None
+    mk = re.search(r"(\d+(?:[.,]\d+)?)\s*k\b", low)
+    if mk:
+        try:
+            amount = float(mk.group(1).replace(",", ".")) * 1000
+        except ValueError:
+            amount = None
+    if amount is None:
+        mtr = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:tr|triệu|trieu)\b", low)
+        if mtr:
+            try:
+                amount = float(mtr.group(1).replace(",", ".")) * 1_000_000
+            except ValueError:
+                amount = None
+
+    if amount is None or amount <= 0:
+        return None
+
+    income_kw = (
+        "lương",
+        "luong",
+        "salary",
+        "thưởng",
+        "thuong",
+        "bonus",
+        "thu nhập",
+        "thu nhap",
+        "nhận được",
+        "nhan duoc",
+    )
+    tx_type = "income" if any(k in low for k in income_kw) else "expense"
+    category = "other_income" if tx_type == "income" else "other_expense"
+    if tx_type == "expense":
+        if any(w in low for w in ("ăn", "an ", "food", "cơm", "com", "trưa", "trua")):
+            category = "food"
+        elif any(w in low for w in ("mua", "buy")):
+            category = "shopping"
+
+    return {
+        "intent": "finance",
+        "confidence": 0.72,
+        "finance": {"type": tx_type, "amount": amount, "category": category},
+    }
+
+
+def post_proxy_json(payload):
+    res = requests.post(PROXY_URL, json=payload, timeout=30)
+    if res.status_code != 200:
+        return None, res
+    try:
+        data = res.json()
+    except json.JSONDecodeError:
+        return None, res
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None, res
+    return content, res
+
+
+# ---------------- AI ROUTER (INTENT ONLY) ----------------
+def ai_router(text):
+    task = f"INPUT:\n<<<{text}>>>"
+    user_content = proxy_safe_user_content(ROUTER_CLASSIFIER_INSTRUCTIONS.strip(), task)
+    payload = {
+        "messages": [{"role": "user", "content": user_content}],
+        "temperature": ROUTER_TEMPERATURE,
+        "max_tokens": ROUTER_MAX_TOKENS,
     }
 
     try:
-        res = requests.post(PROXY_URL, json=payload, timeout=30)
-
-        if res.status_code != 200:
-            return fallback_router()
-
-        data = res.json()
-        content = data["choices"][0]["message"]["content"]
+        content, res = post_proxy_json(payload)
+        if content is None:
+            return fallback_router(text)
 
         print("RAW ROUTER:", content)
 
-        # strip markdown code fences if present
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("```", 2)[1]
-            if content.startswith("json"):
-                content = content[4:]
-        content = content.strip().rstrip("`").strip()
+        parsed = parse_router_response(content)
+        if parsed is not None:
+            return parsed
 
-        return json.loads(content)
+        retry_task = task + "\n\nRespond with JSON only. No markdown fences, no prose."
+        retry_payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": proxy_safe_user_content(
+                        ROUTER_CLASSIFIER_INSTRUCTIONS.strip(), retry_task
+                    ),
+                }
+            ],
+            "temperature": ROUTER_TEMPERATURE,
+            "max_tokens": ROUTER_MAX_TOKENS,
+        }
+        content2, res2 = post_proxy_json(retry_payload)
+        if content2 is None:
+            return fallback_router(text)
+
+        print("RAW ROUTER (retry):", content2)
+        parsed2 = parse_router_response(content2)
+        if parsed2 is not None:
+            return parsed2
+
+        return fallback_router(text)
 
     except Exception as e:
         print("ROUTER ERROR:", e)
-        return fallback_router()
+        return fallback_router(text)
 
 # ---------------- FALLBACK ROUTER ----------------
-def fallback_router():
+def fallback_router(text=None):
+    if text:
+        heur = parse_transaction_heuristic(text)
+        if heur:
+            return heur
     return {
         "intent": "chat",
         "confidence": 0.5,
@@ -300,50 +746,154 @@ def ai_chat(text, user_id):
     history = get_chat_history(user_id, limit=12)
     finance_context = build_finance_context(user_id)
 
-    system_prompt = (
-        "You are a personal finance coach. You have access to the user's real transaction history below. "
-        "Use it to give personalized, data-driven advice.\n\n"
-        f"{finance_context}\n\n"
-        "Guidelines:\n"
-        "- Reference the user's actual numbers and spending patterns when relevant.\n"
-        "- Be encouraging but honest — point out overspending if you see it.\n"
-        "- Give concrete, actionable advice.\n"
-        "- Keep responses concise (2-4 sentences unless a detailed plan is requested).\n"
-        "- Reply in the same language the user writes in (Vietnamese or English)."
+    coach_instructions_full = (
+        COACH_MANDATE_COMPACT
+        + "\n\nYou have access to this user's real ledger for this turn:\n\n"
+        + finance_context
+        + "\n\nUse the FINANCIAL OVERVIEW and RECENT TRANSACTIONS above for personalized, data-driven advice.\n\n"
+        + _COACH_TOOL_INSTRUCTIONS.strip()
     )
 
     messages = []
-
     for role, content in history:
-        messages.append({"role": role, "content": content})
+        if role == "user":
+            wrapped = proxy_safe_user_content(COACH_MANDATE_COMPACT, content)
+            messages.append({"role": "user", "content": wrapped})
+        else:
+            messages.append({"role": "assistant", "content": content})
 
-    messages.append({"role": "user", "content": f"{system_prompt}\n\n---\n\nUser message:\n{text}"})
+    messages.append(
+        {
+            "role": "user",
+            "content": proxy_safe_user_content(coach_instructions_full, text),
+        }
+    )
 
-    payload = {
-        "messages": messages,
-        "temperature": 0.5,
-        "max_tokens": 500
-    }
+    max_rounds = 5
+    final_reply = None
 
     try:
-        res = requests.post(PROXY_URL, json=payload, timeout=30)
-        data = res.json()
-        reply = data["choices"][0]["message"]["content"]
+        for _ in range(max_rounds):
+            payload = {
+                "messages": messages,
+                "temperature": COACH_TEMPERATURE,
+                "max_tokens": COACH_MAX_TOKENS,
+            }
+            reply, res = post_proxy_json(payload)
+            if reply is None:
+                print(
+                    "CHAT ERROR: bad response status or JSON",
+                    getattr(res, "status_code", None),
+                )
+                return "Sorry, I couldn't process that. Please try again."
+
+            spec = extract_tool_spec(reply)
+            if spec is None:
+                final_reply = strip_visible_reply(reply)
+                break
+
+            tool_output = execute_coach_tool(user_id, spec)
+            messages.append({"role": "assistant", "content": reply.strip()})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": proxy_safe_user_content(
+                        "The assistant requested a tool. Below is TOOL_RESULT (plain text). "
+                        "Use it to answer the user. Reply with user-facing advice only — no <<<TOOL>>> blocks.",
+                        f"TOOL_RESULT:\n{tool_output}",
+                    ),
+                }
+            )
+
+        if final_reply is None:
+            final_reply = "Sorry — I could not finish that answer. Please try again."
 
         save_chat_message(user_id, "user", text)
-        save_chat_message(user_id, "assistant", reply)
+        save_chat_message(user_id, "assistant", final_reply)
 
-        return reply
+        return final_reply
     except Exception as e:
         print("CHAT ERROR:", e)
         return "Sorry, I couldn't process that. Please try again."
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    user = update.effective_user
+    msg = (
         "👋 Finance bot ready.\n\nLog transactions naturally (e.g. \"ăn 50k\") "
         "or ask your finance coach anything. Type /help for more."
     )
+    url, sheet_err = ensure_google_sheet(user.id, user.username or str(user.id))
+    if url:
+        msg += f"\n\n📗 Google Sheet (sync): {url}"
+    elif sheet_err:
+        msg += f"\n\n📗 {sheet_err}"
+    await update.message.reply_text(msg)
+
+
+async def sheet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    url, sheet_err = ensure_google_sheet(user.id, user.username or str(user.id))
+    if url:
+        await update.message.reply_text(f"📗 Your spreadsheet:\n{url}")
+    elif sheet_err:
+        await update.message.reply_text(f"📗 Google Sheets\n\n{sheet_err}")
+    else:
+        await update.message.reply_text(
+            "Google Sheets is not configured. Put your service-account JSON as "
+            "google-service-account.json in the bot folder, or set GOOGLE_SERVICE_ACCOUNT_FILE in .env. "
+            "Install: google-auth + google-api-python-client."
+        )
+
+
+async def linksheet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not sheet_sync.sheets_available():
+        await update.message.reply_text(
+            "Google Sheets is not configured. Add google-service-account.json (or GOOGLE_SERVICE_ACCOUNT_FILE)."
+        )
+        return
+
+    arg = " ".join(context.args).strip()
+    if not arg:
+        email = sheet_sync.service_account_email() or "(open google-service-account.json → client_email)"
+        await update.message.reply_text(
+            "Usage: /linksheet <sheet URL or spreadsheet ID>\n\n"
+            "1) Create a Google Sheet.\n"
+            f"2) Share — add this account as Editor:\n{email}\n"
+            "3) Send:\n/linksheet https://docs.google.com/spreadsheets/d/…"
+        )
+        return
+
+    sid = sheet_sync.parse_spreadsheet_id(arg)
+    if not sid:
+        await update.message.reply_text(
+            "Could not find a spreadsheet ID. Paste the full docs.google.com link, or the ID only."
+        )
+        return
+
+    try:
+        sid, url = sheet_sync.prepare_linked_spreadsheet(sid)
+    except Exception as e:
+        await update.message.reply_text(f"Could not link that spreadsheet:\n{e}")
+        return
+
+    user_id = update.effective_user.id
+    save_user_sheet(user_id, sid, url)
+    cursor.execute(
+        """
+        SELECT time, type, amount, category FROM transactions
+        WHERE user_id = ? ORDER BY id ASC
+        """,
+        (user_id,),
+    )
+    backfill = cursor.fetchall()
+    if backfill:
+        try:
+            sheet_sync.backfill_transactions(sid, list(backfill))
+        except Exception as e:
+            print("SHEET BACKFILL ERROR:", e)
+
+    await update.message.reply_text(f"Linked. New rows will sync here:\n{url}")
 
 # ---------------- HELP ----------------
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -399,6 +949,10 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """, (user_id, parsed["type"], parsed["amount"], parsed["category"]))
 
     conn.commit()
+
+    snap = last_transaction_snapshot(user_id)
+    if snap:
+        append_row_to_user_sheet(user_id, snap[0], snap[1], snap[2], snap[3])
 
     await update.message.reply_text(
         f"✅ Added: {parsed['type']} {parsed['amount']:,.0f} ({parsed['category']})"
@@ -508,6 +1062,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
+        snap = last_transaction_snapshot(user_id)
+        if snap:
+            append_row_to_user_sheet(user_id, snap[0], snap[1], snap[2], snap[3])
+
         del pending[user_id]
         await query.edit_message_text("✅ Saved")
 
@@ -524,6 +1082,8 @@ def main():
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("reset_chat", reset_chat))
+    app.add_handler(CommandHandler("sheet", sheet_command))
+    app.add_handler(CommandHandler("linksheet", linksheet_command))
     app.add_handler(CommandHandler("add", add_command))
 
     app.add_handler(CallbackQueryHandler(button_handler))
@@ -534,4 +1094,12 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--reload" in sys.argv:
+        sys.argv = [a for a in sys.argv if a != "--reload"]
+        import dev_run
+
+        dev_run.main()
+    else:
+        main()
