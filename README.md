@@ -1,53 +1,74 @@
 # CashButler
-A Telegram bot that helps users track expenses and get personalized AI financial advice based on their spending behavior.
+
+Telegram bot for logging income and expenses, syncing to a **Google Sheet**, and chatting with an **AI finance coach** that understands your ledger and can pull **live web** results when needed.
 
 ## Features
-- Log income & expenses
-- AI intent detection (finance / chat / command help)
-- Personal finance coach (ledger-aware advice + optional internal search tools)
-- Optional Google Sheet per user (you create the file, share it with the bot service account, `/linksheet`)
-- Multi-user support
+
+- **Natural language entry** — log spending or income in plain language; an intent router classifies **finance** vs **chat** vs **bot help**.
+- **Confirm flow** — parsed amounts show inline confirm/cancel before saving.
+- **AI coach** — answers in Vietnamese or English; treats the ledger as **partial** (asks clarifying questions); optional tools: internal KB, ledger search, category totals, **web search**, and **fetch URL**.
+- **Live web when it matters** — the router sets `needs_live_web` for messages that need fresh public info (e.g. news, rates); the bot can **prefetch search snippets** into the coach prompt so replies cite real sources.
+- **Google Sheets** — each user links their own file via **`/linksheet`**. The bot builds a **Dashboard** tab (KPIs, expense breakdown, pie chart) and a formatted **Transactions** log; new rows append automatically.
+- **Multi-user** — per-user SQLite ledger and sheet mapping.
 
 ## Commands
-- `/start` – Start bot (shows Sheet link or steps to `/linksheet` when Google is configured)
-- `/help` – Show help message
-- `/summary` – Show total income, expenses, balance
-- `/history` – Show last transactions
-- `/sheet` – Show your spreadsheet URL
-- `/linksheet` – Connect a Google Sheet you own (after sharing the service account as Editor)
+
+| Command | What it does |
+|--------|----------------|
+| `/start` | Welcome; shows sheet link or how to `/linksheet` if Google is configured |
+| `/help` | Short command and usage summary |
+| `/add` | Quick add: `/add expense 50k lunch` / `/add income 10tr salary` |
+| `/summary` | Totals: income, expenses, balance |
+| `/history` | Recent transactions |
+| `/sheet` | Your linked spreadsheet URL |
+| `/linksheet` | Connect a sheet you own (paste URL or spreadsheet ID after sharing the service account as **Editor**) |
+| `/reset_chat` | Clear coach conversation history for you |
 
 ## Setup
-### 1. Install dependencies
+
+### 1. Install
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Create .env
+### 2. Environment
+
+Create `.env` (see `.env.example`):
+
 ```
 TOKEN=your_telegram_bot_token
-PROXY_URL=your_ai_api_endpoint
+PROXY_URL=your_openai_compatible_chat_endpoint
 ```
 
-Optional — Google Sheets sync:
+The bot posts chat/router payloads to `PROXY_URL` as JSON (`messages`, `temperature`, `max_tokens`), same shape as typical OpenAI-compatible APIs.
 
-1. Create a Google Cloud project, enable **Google Sheets API** and **Google Drive API**.
-2. Create a **service account**, download its JSON key.
-3. Save the key as **`google-service-account.json`** in the project folder (same folder as `finance_bot.py`), **or** set `GOOGLE_SERVICE_ACCOUNT_FILE` in `.env` to its path.
-4. Each user: create a **Google Sheet**, click **Share**, add the service account email (from the JSON, `client_email`) as **Editor**, then in Telegram run **`/linksheet`** with the sheet URL or spreadsheet ID. The bot adds/uses a **Transactions** tab and writes rows there.
-5. **Optional — extra collaborators:** `GOOGLE_SHEETS_SHARE_EMAILS` lets the service account invite Gmail addresses (may fail on some user-owned files if Drive denies ACL changes). Use **`GOOGLE_SHEETS_SHARE_ROLE=reader`** if you only need view access for those addresses.
-6. *(Legacy)* `GOOGLE_SHEETS_PUBLIC_LINK=true` — “anyone with the link” reader (less private).
-7. *(Legacy)* `GOOGLE_SHEETS_AUTO_CREATE=true` — try **Drive API** `files.create` per user instead of `/linksheet` (requires **non-zero** Drive quota on the service account; many accounts have **none**).
+### 3. Google Sheets (optional)
 
-**Note:** Service accounts often have **no** personal Drive quota. The default is **user-owned sheet + `/linksheet`**, which only needs **Sheets API** + **Editor** share to the service account.
+1. In Google Cloud, enable **Google Sheets API** and **Google Drive API** for the project that owns your service account.
+2. Create a service account, download a JSON key.
+3. Place **`google-service-account.json`** next to `main.py`, or set **`GOOGLE_SERVICE_ACCOUNT_FILE`** in `.env`.
+4. In Google Drive, create a spreadsheet, **Share** → add the key’s **`client_email`** as **Editor**.
+5. In Telegram, run **`/linksheet`** with the sheet URL or ID.
 
-### 3. Run bot
+Optional `.env` knobs:
+
+- **`GOOGLE_SHEETS_SHARE_EMAILS`** — comma-separated Gmail addresses the bot may invite (Drive permitting).
+- **`WEB_SEARCH_ENABLED`**, **`WEB_SEARCH_MAX_RESULTS`** — DuckDuckGo-backed coach search.
+- **`WEB_FETCH_*`** — guarded HTTP fetch for the coach (`fetch_url` tool).
+
+Service accounts often have **no personal Drive storage**; linking **your** sheet avoids `files.create` quota issues.
+
+### 4. Run
+
 ```bash
-python finance_bot.py
+python main.py
 ```
 
-Development (restart bot when `*.py` or `finance_kb.json` changes):
+Hot reload while editing Python or `finance_kb.json`:
+
 ```bash
-python finance_bot.py --reload
+python main.py --reload
 # or
 python dev_run.py
 ```

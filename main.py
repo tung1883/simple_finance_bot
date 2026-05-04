@@ -3,11 +3,13 @@ import json
 import re
 import requests
 import os
+from datetime import date
 from typing import Optional, Tuple
 
 from dotenv import load_dotenv
 
 import sheet_sync
+from web_tools import run_fetch_url, run_web_search, web_search_enabled
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -152,11 +154,38 @@ def build_finance_context(user_id):
         tx_lines = "  (no transactions recorded yet)"
 
     return (
-        f"FINANCIAL OVERVIEW:\n"
-        f"  Total income:   {income:,.0f}\n"
-        f"  Total expenses: {expense:,.0f}\n"
-        f"  Balance:        {balance:,.0f}\n\n"
-        f"RECENT TRANSACTIONS (newest first):\n{tx_lines}"
+        "LEDGER SNAPSHOT (IMPORTANT):\n"
+        "  This is ONLY what the user has logged inside this bot — not their bank balance, payslip, "
+        "cash, investments, debts, or spending outside the bot. Missing income here does NOT mean they "
+        "have no income; missing expenses does NOT mean they spend only what you see.\n\n"
+        f"AGGREGATES FROM BOT LOG (partial picture):\n"
+        f"  Income logged:   {income:,.0f}\n"
+        f"  Expenses logged: {expense:,.0f}\n"
+        f"  Net (log only):   {balance:,.0f}\n\n"
+        f"RECENT LOGGED TRANSACTIONS (newest first, capped):\n{tx_lines}"
+    )
+
+
+def prefetch_live_web_for_coach(
+    user_message: str,
+    needs_live_web: bool,
+    web_search_query: Optional[str] = None,
+) -> str:
+    """Inject web_search results when the intent router set needs_live_web (chat only)."""
+    if not needs_live_web or not web_search_enabled():
+        return ""
+    q = (web_search_query or "").strip() or (user_message or "").strip()[:220]
+    if not q:
+        return ""
+    try:
+        blob = run_web_search(q)
+    except Exception as e:
+        blob = f"(web_search error: {type(e).__name__}: {e})"
+    return (
+        "\n\n=== LIVE WEB (prefetched — intent router set needs_live_web; REQUIRED: summarize in the "
+        "user's language with bullet points, source titles, and URLs from the text below. Do NOT reply "
+        "that you lack real-time data unless prefetch failed or returned no results.) ===\n"
+        f"{blob}\n=== END LIVE WEB ===\n"
     )
 
 
@@ -292,6 +321,10 @@ def execute_coach_tool(user_id, spec: dict) -> str:
         return search_ledger_db(user_id, query)
     if name == "spending_by_category":
         return spending_by_category_block(user_id)
+    if name == "web_search":
+        return run_web_search(query)
+    if name == "fetch_url":
+        return run_fetch_url(query)
     return f"(Unknown tool: {name})"
 
 
@@ -381,23 +414,36 @@ PROXY_PROMPT_BEGIN = "<<<PROXY_SAFE_PROMPT_BEGIN>>>"
 PROXY_PROMPT_END = "<<<PROXY_SAFE_PROMPT_END>>>"
 
 ROUTER_TEMPERATURE = 0.1
-ROUTER_MAX_TOKENS = 200
-COACH_TEMPERATURE = 0.5
-COACH_MAX_TOKENS = 900
+ROUTER_MAX_TOKENS = 280
+COACH_TEMPERATURE = 0.55
+COACH_MAX_TOKENS = 1200
 
 _COACH_TOOL_INSTRUCTIONS = """
 TOOL_USE (optional):
-If general frameworks OR deeper ledger detail would improve your answer, request ONE tool by replying with ONLY this block (no other text):
+Request ONE tool by replying with ONLY this block (no other text):
 <<<TOOL
 {"tool":"<name>","query":"<optional string>"}
 >>>
 
-Tools:
-- search_kb — short curated guidance on personal finance topics (pass keywords in query).
-- search_ledger — find this user's transactions matching query keywords (categories, types).
-- spending_by_category — expense totals grouped by category for this user (query may be empty or "{}")
+When to use tools (be selective — most replies need no tool):
+- Default: answer from the conversation, ledger context, and general coaching. Do NOT call web_search on every message.
+- If your instructions for this turn already include a "LIVE WEB (prefetched)" section with results, summarize that and do NOT call web_search again for the same need.
+- search_kb — curated finance_kb snippets; use for generic frameworks when useful.
+- search_ledger — this user’s logged transactions (keywords).
+- spending_by_category — expense totals by category from the log.
+- web_search — ONLY when you need time-sensitive PUBLIC info and there is NO prefetched LIVE WEB block with usable results (news, rates, policy, markets, fact-checking). Skip for pure habits/emotions/ledger-only coaching.
+- fetch_url — ONLY after you have a specific http(s) URL (from the user or from web_search) and the snippets are not enough; one credible article or official page. Pass the full URL in "query".
 
-After you receive a TOOL_RESULT message, synthesize a concise answer for the user. Do not repeat the <<<TOOL>>> syntax in the final answer.
+Do not chain unnecessarily: often web_search alone is enough; fetch_url at most one follow-up for one link.
+
+Tools:
+- search_kb — keywords → short curated guidance.
+- search_ledger — keywords → matching logged rows.
+- spending_by_category — query often "{}"; grouped expense totals.
+- web_search — focused search query string; cite titles/URLs you use; never invent results.
+- fetch_url — full URL string; summarize only extracted text; note if extraction failed.
+
+After TOOL_RESULT, synthesize for the user; do not repeat <<<TOOL>>>.
 """
 
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -425,12 +471,31 @@ FORMAT:
 {
   "intent": "finance | chat | help_command",
   "confidence": number,
+  "needs_live_web": boolean,
+  "web_search_query": string | null,
   "finance": {
     "type": "income|expense|null",
     "amount": number|null,
     "category": string|null
   }
 }
+
+========================
+FIELD: needs_live_web + web_search_query
+========================
+
+Set "needs_live_web": true ONLY when answering well requires **fresh or verifiable information from the public web**
+that you cannot rely on from static training alone. Examples: today’s financial/news headlines, current market
+indices or FX, breaking policy or central-bank moves, “what happened to [asset] today”, looking up a cited fact.
+
+Set "needs_live_web": false for: **help_command**; **finance** (transaction logging); generic budgeting,
+savings tips, empathy, hypotheticals, math, or advice grounded only in the user’s bot ledger — even if the
+topic is “finance”, unless they explicitly want **live** external facts.
+
+When "needs_live_web": true, set "web_search_query" to a **short focused search string** (same language as the
+user when possible). When false, use null for "web_search_query".
+
+"needs_live_web" MUST be false when intent is "finance" or "help_command".
 
 ========================
 STRICT RULES (VERY IMPORTANT)
@@ -499,43 +564,64 @@ IMPORTANT:
 👉 ANYTHING NOT CLEARLY A TRANSACTION = chat
 
 ========================
-EXAMPLES
+EXAMPLES (JSON fields abbreviated — always return full FORMAT)
 ========================
 
 "cho tôi lời khuyên giúp tôi chi tiêu hiệu quả hơn"
-→ chat
+→ chat, needs_live_web: false, web_search_query: null
 
 "tôi nên tiết kiệm thế nào"
-→ chat
+→ chat, needs_live_web: false
 
-"cách quản lý tiền tốt hơn"
-→ chat
+"cập nhật tin tài chính hôm nay"
+→ chat, needs_live_web: true, web_search_query: "tin tài chính hôm nay"
+
+"update financial news today for me"
+→ chat, needs_live_web: true, web_search_query: "financial news today"
+
+"current Fed funds rate today"
+→ chat, needs_live_web: true, web_search_query: "Federal Reserve fed funds rate today"
 
 "ăn 50k"
-→ finance
+→ finance, needs_live_web: false, web_search_query: null
 
 "lương 10 triệu"
-→ finance
+→ finance, needs_live_web: false
 
 "bot có những lệnh gì"
-→ help_command
+→ help_command, needs_live_web: false
 
 "cho tôi link google sheet"
-→ help_command
+→ help_command, needs_live_web: false
 
 "hôm nay thế nào"
-→ chat
+→ chat, needs_live_web: false (unless they clearly ask for news — then true with a query)
 """
 
 
-COACH_MANDATE_COMPACT = """You are a personal finance coach for this Telegram bot.
+COACH_MANDATE_COMPACT = """You are an experienced personal finance coach on Telegram (not a robot that only reacts to one table).
 
-Guidelines:
-- Reference the user's actual numbers and spending patterns when FINANCIAL OVERVIEW data is included in your instructions for this turn.
-- Be encouraging but honest — point out overspending if you see it.
-- Give concrete, actionable advice.
-- Keep responses concise (2-4 sentences unless a detailed plan is requested).
-- Reply in the same language the user writes in (Vietnamese or English)."""
+How to treat the numbers:
+- Anything labeled as logged in this bot is a PARTIAL sample. Do not infer “total income”, “you have no income”, “your balance is X”, or “you only spend on Y” from aggregates alone.
+- If the log shows no income or skewed spending, acknowledge that and ASK whether they track salary, side income, family support, irregular cash flows, or spending elsewhere — before you draw conclusions.
+- Distinguish confirmed facts (what appears in the log) from assumptions; say what you would need to know to be sure.
+
+Coaching style (human-like):
+- Start from their actual question and context; use the log to illustrate patterns when relevant, not as the whole story.
+- When advice could depend on missing facts (goals, timeline, dependants, job stability, emergency fund, existing debt, risk tolerance, currency/locale), ask 1–3 focused questions OR offer conditional guidance (“If A, then …; if B, then …”).
+- Before telling them to cut specific categories (e.g. food, entertainment), check what is discretionary vs fixed for them, and whether they want aggressive saving or sustainable habits.
+- For investing, large purchases, or debt payoff: mention basics (emergency buffer, high-interest debt first, match employer plans where applicable) and avoid overconfident product picks without knowing their situation.
+- Be warm and direct, not preachy. Offer a short structure when helpful: clarify → prioritize → one or two next steps.
+
+Length: default to a tight answer; use a short paragraph plus bullets when they need a plan or several questions. Reply in the same language the user writes in (Vietnamese or English).
+
+Web tools (intelligent use):
+- You decide per message: use web_search / fetch_url only when fresh or external facts clearly add value. For empathy, budgeting talk, or ledger-only questions, respond without web tools.
+- When you do use web tools, summarize only what came back, name sources (titles + URLs), and avoid overclaiming; snippets and extracts can be incomplete or wrong.
+- If a "LIVE WEB (prefetched)" block appears in your instructions for this turn, you MUST treat it as the web_search result: summarize those headlines/snippets with links. Never answer "I have no real-time data" when that block contains results."""
+
+
+COACH_MANDATE_LITE = """You are a personal finance coach on Telegram. Treat any ledger in the conversation as partial bot-logged data only — do not assume it is their full financial life. Ask clarifying questions when advice depends on missing facts. Use web_search/fetch_url only when the user clearly needs up-to-date public facts, not for every reply. Reply in the user's language (Vietnamese or English)."""
 
 
 def extract_first_json_object(text: str):
@@ -577,6 +663,41 @@ def parse_router_response(raw: str):
         except json.JSONDecodeError:
             pass
     return None
+
+
+def normalize_router_result(data: Optional[dict]) -> dict:
+    """Ensure intent, finance, and router web-search fields; needs_live_web only applies to chat."""
+    out = {
+        "intent": "chat",
+        "confidence": 0.0,
+        "finance": None,
+        "needs_live_web": False,
+        "web_search_query": None,
+    }
+    if isinstance(data, dict):
+        out.update(data)
+
+    intent = out.get("intent", "chat")
+    if intent not in ("finance", "chat", "help_command"):
+        intent = "chat"
+    out["intent"] = intent
+
+    flag = out.get("needs_live_web", False)
+    if isinstance(flag, str):
+        flag = flag.strip().lower() in ("1", "true", "yes")
+    out["needs_live_web"] = bool(flag) and intent == "chat"
+
+    q = out.get("web_search_query")
+    if q is not None and not isinstance(q, str):
+        q = str(q)
+    q = (q or "").strip() or None
+    out["web_search_query"] = q
+
+    fin = out.get("finance")
+    if fin is not None and not isinstance(fin, dict):
+        out["finance"] = None
+
+    return out
 
 
 _HEURISTIC_ADVICE_MARKERS = (
@@ -693,13 +814,13 @@ def ai_router(text):
     try:
         content, res = post_proxy_json(payload)
         if content is None:
-            return fallback_router(text)
+            return normalize_router_result(fallback_router(text))
 
         print("RAW ROUTER:", content)
 
         parsed = parse_router_response(content)
         if parsed is not None:
-            return parsed
+            return normalize_router_result(parsed)
 
         retry_task = task + "\n\nRespond with JSON only. No markdown fences, no prose."
         retry_payload = {
@@ -716,18 +837,18 @@ def ai_router(text):
         }
         content2, res2 = post_proxy_json(retry_payload)
         if content2 is None:
-            return fallback_router(text)
+            return normalize_router_result(fallback_router(text))
 
         print("RAW ROUTER (retry):", content2)
         parsed2 = parse_router_response(content2)
         if parsed2 is not None:
-            return parsed2
+            return normalize_router_result(parsed2)
 
-        return fallback_router(text)
+        return normalize_router_result(fallback_router(text))
 
     except Exception as e:
         print("ROUTER ERROR:", e)
-        return fallback_router(text)
+        return normalize_router_result(fallback_router(text))
 
 # ---------------- FALLBACK ROUTER ----------------
 def fallback_router(text=None):
@@ -738,26 +859,37 @@ def fallback_router(text=None):
     return {
         "intent": "chat",
         "confidence": 0.5,
-        "finance": None
+        "finance": None,
+        "needs_live_web": False,
+        "web_search_query": None,
     }
 
 # ---------------- FINANCE COACH CHAT ----------------
-def ai_chat(text, user_id):
+def ai_chat(
+    text,
+    user_id,
+    *,
+    needs_live_web: bool = False,
+    web_search_query: Optional[str] = None,
+):
     history = get_chat_history(user_id, limit=12)
     finance_context = build_finance_context(user_id)
 
+    today = date.today().isoformat()
     coach_instructions_full = (
         COACH_MANDATE_COMPACT
-        + "\n\nYou have access to this user's real ledger for this turn:\n\n"
+        + f"\n\nToday's date (server): {today}\n\n"
+        + "Context for this turn (use as hints, not as their complete finances):\n\n"
         + finance_context
-        + "\n\nUse the FINANCIAL OVERVIEW and RECENT TRANSACTIONS above for personalized, data-driven advice.\n\n"
+        + "\n\nUse tools only when justified (see tool policy). In your reply, separate what the log shows from what you still need to ask them.\n\n"
         + _COACH_TOOL_INSTRUCTIONS.strip()
+        + prefetch_live_web_for_coach(text, needs_live_web, web_search_query)
     )
 
     messages = []
     for role, content in history:
         if role == "user":
-            wrapped = proxy_safe_user_content(COACH_MANDATE_COMPACT, content)
+            wrapped = proxy_safe_user_content(COACH_MANDATE_LITE, content)
             messages.append({"role": "user", "content": wrapped})
         else:
             messages.append({"role": "assistant", "content": content})
@@ -799,7 +931,9 @@ def ai_chat(text, user_id):
                     "role": "user",
                     "content": proxy_safe_user_content(
                         "The assistant requested a tool. Below is TOOL_RESULT (plain text). "
-                        "Use it to answer the user. Reply with user-facing advice only — no <<<TOOL>>> blocks.",
+                        "Use it to answer the user. Separate log facts from open questions; avoid overconfident claims. "
+                        "For web_search/fetch_url output, treat text as provisional and cite sources. "
+                        "Reply with user-facing advice only — no <<<TOOL>>> blocks.",
                         f"TOOL_RESULT:\n{tool_output}",
                     ),
                 }
@@ -1003,14 +1137,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intent = result.get("intent", "chat")
     finance = result.get("finance") or {}
 
-    print("INTENT:", intent)
+    print("INTENT:", intent, "| needs_live_web:", result.get("needs_live_web"))
 
     if intent == "help_command":
         await update.message.reply_text(help_text())
         return
 
     if intent == "chat":
-        reply = ai_chat(text, user_id)
+        reply = ai_chat(
+            text,
+            user_id,
+            needs_live_web=bool(result.get("needs_live_web")),
+            web_search_query=result.get("web_search_query"),
+        )
         await update.message.reply_text(reply)
         return
 

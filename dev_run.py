@@ -1,4 +1,4 @@
-"""Restart finance_bot.py when local source or finance_kb.json changes (development)."""
+"""Restart main.py when local source or finance_kb.json changes (development)."""
 
 import subprocess
 import sys
@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-BOT = ROOT / "finance_bot.py"
+BOT = ROOT / "main.py"
 POLL_INTERVAL = 0.6
 
 
@@ -30,7 +30,7 @@ def _mtime_snapshot(paths):
 
 def main():
     if not BOT.is_file():
-        print("finance_bot.py not found next to dev_run.py")
+        print("main.py not found next to dev_run.py")
         sys.exit(1)
 
     cmd = [sys.executable, str(BOT)]

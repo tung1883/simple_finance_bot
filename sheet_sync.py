@@ -7,8 +7,8 @@ Credentials (first match wins):
   2. Otherwise: google-service-account.json in the project folder (next to this file)
 
 **Default flow:** each Telegram user creates their own Google Sheet, shares it with the service account
-as **Editor**, then runs `/linksheet` with the URL or spreadsheet ID. The bot uses **Sheets API** only
-(append/backfill + a named **Transactions** tab with headers).
+as **Editor**, then runs `/linksheet` with the URL or spreadsheet ID. The bot builds a **Dashboard**
+summary tab (KPIs, expense breakdown, optional chart) and a formatted **Transactions** log.
 
 **Optional:** set `GOOGLE_SHEETS_AUTO_CREATE=true` to attempt **Drive API** `files.create` per user (needs
 non-zero Drive quota on the service account).
@@ -212,6 +212,25 @@ def _apply_drive_sharing(drive, spreadsheet_id: str) -> None:
 
 
 TRANSACTION_TAB = "Transactions"
+DASHBOARD_TAB = "Dashboard"
+
+# Theme (0–1 RGB)
+_HDR_BG = {"red": 0.125, "green": 0.22, "blue": 0.384}
+_HDR_FG = {"red": 1, "green": 1, "blue": 1}
+_ACCENT = {"red": 0.2, "green": 0.4, "blue": 0.65}
+_SUBTITLE_FG = {"red": 0.35, "green": 0.35, "blue": 0.4}
+_KPI_LABEL_BG = {"red": 0.96, "green": 0.97, "blue": 0.99}
+
+
+def _sheet_ids_by_title(meta: dict) -> dict:
+    out = {}
+    for sh in meta.get("sheets") or []:
+        props = sh.get("properties") or {}
+        title = props.get("title") or ""
+        sid = props.get("sheetId")
+        if title and sid is not None:
+            out[title] = sid
+    return out
 
 
 def _ensure_transactions_tab(sheets, spreadsheet_id: str) -> None:
@@ -237,6 +256,542 @@ def _ensure_transactions_tab(sheets, spreadsheet_id: str) -> None:
             ]
         },
     ).execute()
+
+
+def _ensure_dashboard_sheet(sheets, spreadsheet_id: str, meta: dict) -> dict:
+    titles = _sheet_ids_by_title(meta)
+    if DASHBOARD_TAB in titles:
+        return meta
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "addSheet": {
+                        "properties": {
+                            "title": DASHBOARD_TAB,
+                            "gridProperties": {"rowCount": 200, "columnCount": 14},
+                        }
+                    }
+                }
+            ]
+        },
+    ).execute()
+    return sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+
+
+def _reorder_tabs_dashboard_first(sheets, spreadsheet_id: str, meta: dict) -> None:
+    """Dashboard leftmost, then Transactions, then any other tabs."""
+    ordered_titles = []
+    titles = _sheet_ids_by_title(meta)
+    if DASHBOARD_TAB in titles:
+        ordered_titles.append(DASHBOARD_TAB)
+    if TRANSACTION_TAB in titles:
+        ordered_titles.append(TRANSACTION_TAB)
+    for sh in meta.get("sheets") or []:
+        t = (sh.get("properties") or {}).get("title", "")
+        if t and t not in ordered_titles:
+            ordered_titles.append(t)
+    if not ordered_titles:
+        return
+    requests = []
+    for idx, title in enumerate(ordered_titles):
+        sid = titles.get(title)
+        if sid is None:
+            continue
+        requests.append(
+            {
+                "updateSheetProperties": {
+                    "properties": {"sheetId": sid, "index": idx},
+                    "fields": "index",
+                }
+            }
+        )
+    if requests:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id, body={"requests": requests}
+        ).execute()
+
+
+def _clear_embedded_charts_on_sheet(
+    sheets, spreadsheet_id: str, sheet_id: int
+) -> None:
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    chart_ids = []
+    for sh in meta.get("sheets", []):
+        if (sh.get("properties") or {}).get("sheetId") != sheet_id:
+            continue
+        for ch in sh.get("charts", []) or []:
+            oid = ch.get("chartId")
+            if oid is not None:
+                chart_ids.append(str(oid))
+    if not chart_ids:
+        return
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {"deleteEmbeddedObject": {"objectId": oid}} for oid in chart_ids
+            ]
+        },
+    ).execute()
+
+
+def _clear_conditional_format_rules(sheets, spreadsheet_id: str, sheet_id: int) -> None:
+    while True:
+        meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        count = 0
+        for sh in meta.get("sheets", []):
+            if (sh.get("properties") or {}).get("sheetId") != sheet_id:
+                continue
+            count = len(sh.get("conditionalFormats", []) or [])
+            break
+        if count == 0:
+            return
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "deleteConditionalFormatRule": {
+                            "sheetId": sheet_id,
+                            "index": count - 1,
+                        }
+                    }
+                ]
+            },
+        ).execute()
+
+
+def _apply_dashboard_and_transaction_ui(
+    sheets, spreadsheet_id: str, dashboard_id: int, transactions_id: int
+) -> None:
+    """Writes Dashboard formulas/KPIs and applies professional formatting + optional chart."""
+    _clear_embedded_charts_on_sheet(sheets, spreadsheet_id, dashboard_id)
+    _clear_conditional_format_rules(sheets, spreadsheet_id, transactions_id)
+
+    q_formula = (
+        '=IFERROR(QUERY(Transactions!A1:D, '
+        '"select D, sum(C) where B = \'expense\' and C is not null and D is not null '
+        'group by D order by sum(C) desc label D \'Category\', sum(C) \'Amount\'",1),"No expenses logged yet.")'
+    )
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "USER_ENTERED",
+            "data": [
+                {
+                    "range": f"{DASHBOARD_TAB}!A1:E1",
+                    "values": [["CashButler — Overview", "", "", "", ""]],
+                },
+                {
+                    "range": f"{DASHBOARD_TAB}!A2:E2",
+                    "values": [
+                        [
+                            "Totals reflect rows on the Transactions tab (bot-synced).",
+                            "",
+                            "",
+                            "",
+                            "",
+                        ]
+                    ],
+                },
+                {
+                    "range": f"{DASHBOARD_TAB}!A4:B7",
+                    "values": [
+                        [
+                            "Total income (logged)",
+                            '=IFERROR(SUMIF(Transactions!B2:B,"income",Transactions!C2:C),0)',
+                        ],
+                        [
+                            "Total expenses (logged)",
+                            '=IFERROR(SUMIF(Transactions!B2:B,"expense",Transactions!C2:C),0)',
+                        ],
+                        ["Net (income − expenses)", "=B4-B5"],
+                        ["Last updated", "=NOW()"],
+                    ],
+                },
+                {
+                    "range": f"{DASHBOARD_TAB}!A9",
+                    "values": [["Expense breakdown (live)"]],
+                },
+                {
+                    "range": f"{DASHBOARD_TAB}!A10",
+                    "values": [[q_formula]],
+                },
+                {
+                    "range": f"{TRANSACTION_TAB}!A1:D1",
+                    "values": [["Time", "Type", "Amount", "Category"]],
+                },
+            ],
+        },
+    ).execute()
+
+    fmt_requests = [
+        {
+            "mergeCells": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 5,
+                },
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "mergeCells": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": 2,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 5,
+                },
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 5,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _ACCENT,
+                        "horizontalAlignment": "CENTER",
+                        "textFormat": {
+                            "foregroundColor": _HDR_FG,
+                            "fontSize": 16,
+                            "bold": True,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": 2,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 5,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"foregroundColor": _SUBTITLE_FG, "fontSize": 10},
+                        "horizontalAlignment": "LEFT",
+                    }
+                },
+                "fields": "userEnteredFormat(textFormat,horizontalAlignment)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 3,
+                    "endRowIndex": 6,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _KPI_LABEL_BG,
+                        "textFormat": {"bold": True, "fontSize": 11},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 3,
+                    "endRowIndex": 6,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 2,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "NUMBER", "pattern": "#,##0.##"},
+                        "horizontalAlignment": "RIGHT",
+                    }
+                },
+                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 6,
+                    "endRowIndex": 7,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _KPI_LABEL_BG,
+                        "textFormat": {"bold": True, "fontSize": 11},
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 6,
+                    "endRowIndex": 7,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 2,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {
+                            "type": "DATE_TIME",
+                            "pattern": "yyyy-mm-dd hh:mm",
+                        },
+                        "horizontalAlignment": "RIGHT",
+                    }
+                },
+                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dashboard_id,
+                    "startRowIndex": 8,
+                    "endRowIndex": 9,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 4,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"bold": True, "fontSize": 11},
+                        "backgroundColor": _KPI_LABEL_BG,
+                    }
+                },
+                "fields": "userEnteredFormat(textFormat,backgroundColor)",
+            }
+        },
+        {
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": transactions_id,
+                    "gridProperties": {"frozenRowCount": 1, "rowCount": 5000},
+                },
+                "fields": "gridProperties(frozenRowCount,rowCount)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": transactions_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 4,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": _HDR_BG,
+                        "horizontalAlignment": "CENTER",
+                        "textFormat": {
+                            "foregroundColor": _HDR_FG,
+                            "bold": True,
+                            "fontSize": 11,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": transactions_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": 5000,
+                    "startColumnIndex": 2,
+                    "endColumnIndex": 3,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": "NUMBER", "pattern": "#,##0.##"},
+                        "horizontalAlignment": "RIGHT",
+                    }
+                },
+                "fields": "userEnteredFormat(numberFormat,horizontalAlignment)",
+            }
+        },
+    ]
+
+    widths = [170, 100, 120, 220]
+    for col, px in enumerate(widths):
+        fmt_requests.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": transactions_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col,
+                        "endIndex": col + 1,
+                    },
+                    "properties": {"pixelSize": px},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+    fmt_requests.extend(
+        [
+            {
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [
+                            {
+                                "sheetId": transactions_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": 5000,
+                                "startColumnIndex": 1,
+                                "endColumnIndex": 2,
+                            }
+                        ],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "TEXT_EQ",
+                                "values": [{"userEnteredValue": "income"}],
+                            },
+                            "format": {
+                                "backgroundColor": {
+                                    "red": 0.91,
+                                    "green": 0.96,
+                                    "blue": 0.91,
+                                }
+                            },
+                        },
+                    },
+                    "index": 0,
+                }
+            },
+            {
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [
+                            {
+                                "sheetId": transactions_id,
+                                "startRowIndex": 1,
+                                "endRowIndex": 5000,
+                                "startColumnIndex": 1,
+                                "endColumnIndex": 2,
+                            }
+                        ],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "TEXT_EQ",
+                                "values": [{"userEnteredValue": "expense"}],
+                            },
+                            "format": {
+                                "backgroundColor": {
+                                    "red": 1,
+                                    "green": 0.92,
+                                    "blue": 0.93,
+                                }
+                            },
+                        },
+                    },
+                    "index": 1,
+                }
+            },
+        ]
+    )
+
+    # Pie chart: skip QUERY header row (spill row 10 = index 9); data from row 11 (index 10)
+    fmt_requests.append(
+        {
+            "addChart": {
+                "chart": {
+                    "spec": {
+                        "title": "Spending by category",
+                        "subtitle": "Expense rows in Transactions",
+                        "pieChart": {
+                            "domain": {
+                                "sourceRange": {
+                                    "sources": [
+                                        {
+                                            "sheetId": dashboard_id,
+                                            "startRowIndex": 10,
+                                            "endRowIndex": 45,
+                                            "startColumnIndex": 0,
+                                            "endColumnIndex": 1,
+                                        }
+                                    ]
+                                }
+                            },
+                            "series": {
+                                "sourceRange": {
+                                    "sources": [
+                                        {
+                                            "sheetId": dashboard_id,
+                                            "startRowIndex": 10,
+                                            "endRowIndex": 45,
+                                            "startColumnIndex": 1,
+                                            "endColumnIndex": 2,
+                                        }
+                                    ]
+                                }
+                            },
+                            "threeDimensional": False,
+                        },
+                    },
+                    "position": {
+                        "overlayPosition": {
+                            "anchorCell": {
+                                "sheetId": dashboard_id,
+                                "rowIndex": 2,
+                                "columnIndex": 5,
+                            },
+                            "widthPixels": 420,
+                            "heightPixels": 300,
+                            "offsetXPixels": 0,
+                            "offsetYPixels": 0,
+                        }
+                    },
+                }
+            }
+        }
+    )
+
+    sheets.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={"requests": fmt_requests}
+    ).execute()
+
+
+def _setup_cashbutler_workbook(sheets, spreadsheet_id: str) -> None:
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    _ensure_transactions_tab(sheets, spreadsheet_id)
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    meta = _ensure_dashboard_sheet(sheets, spreadsheet_id, meta)
+    _reorder_tabs_dashboard_first(sheets, spreadsheet_id, meta)
+    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    titles = _sheet_ids_by_title(meta)
+    if TRANSACTION_TAB not in titles or DASHBOARD_TAB not in titles:
+        raise RuntimeError("Could not set up Dashboard and Transactions tabs.")
+    dash_id = titles[DASHBOARD_TAB]
+    tx_id = titles[TRANSACTION_TAB]
+    _apply_dashboard_and_transaction_ui(sheets, spreadsheet_id, dash_id, tx_id)
 
 
 def create_user_spreadsheet(user_label: str) -> Tuple[str, str]:
@@ -282,7 +837,7 @@ def create_user_spreadsheet(user_label: str) -> Tuple[str, str]:
     spreadsheet_id = created["id"]
 
     try:
-        _ensure_transactions_tab(sheets, spreadsheet_id)
+        _setup_cashbutler_workbook(sheets, spreadsheet_id)
     except HttpError as e:
         if getattr(e.resp, "status", None) == 403:
             raise RuntimeError(
@@ -294,14 +849,6 @@ def create_user_spreadsheet(user_label: str) -> Tuple[str, str]:
 
     _apply_drive_sharing(drive, spreadsheet_id)
 
-    rng = f"{TRANSACTION_TAB}!A1:D1"
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [["Time", "Type", "Amount", "Category"]]},
-    ).execute()
-
     url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
     return spreadsheet_id, url
 
@@ -309,7 +856,8 @@ def create_user_spreadsheet(user_label: str) -> Tuple[str, str]:
 def prepare_linked_spreadsheet(spreadsheet_id: str) -> Tuple[str, str]:
     """
     User-owned spreadsheet already shared with the service account (Editor).
-    Ensures Transactions tab + header row; optional Drive sharing env vars.
+    Builds Dashboard (KPIs, breakdown, chart) + formatted Transactions sheet;
+    optional Drive sharing from env.
     """
     sheets, drive = _services()
     if not sheets or not drive:
@@ -333,7 +881,7 @@ def prepare_linked_spreadsheet(spreadsheet_id: str) -> Tuple[str, str]:
         raise
 
     try:
-        _ensure_transactions_tab(sheets, spreadsheet_id)
+        _setup_cashbutler_workbook(sheets, spreadsheet_id)
     except HttpError as e:
         if getattr(e.resp, "status", None) == 403:
             raise RuntimeError(
@@ -344,14 +892,6 @@ def prepare_linked_spreadsheet(spreadsheet_id: str) -> Tuple[str, str]:
         raise
 
     _apply_drive_sharing(drive, spreadsheet_id)
-
-    rng = f"{TRANSACTION_TAB}!A1:D1"
-    sheets.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=rng,
-        valueInputOption="RAW",
-        body={"values": [["Time", "Type", "Amount", "Category"]]},
-    ).execute()
 
     url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
     return spreadsheet_id, url
