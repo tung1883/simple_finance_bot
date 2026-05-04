@@ -1,5 +1,4 @@
-# Finance Telegram Bot (AI Coach)
-
+# CashButler
 A Telegram bot that helps users track expenses and get personalized AI financial advice based on their spending behavior.
 
 ## Features
