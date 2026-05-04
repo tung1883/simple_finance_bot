@@ -28,10 +28,13 @@ Telegram bot for logging income and expenses, syncing to a **Google Sheet**, and
 
 ### 1. Quick start (recommended)
 
-After cloning the repo:
+The project README title is **CashButler**. Your filesystem folder matches **whatever Git created** when you cloned (often **`cashbutler`** if that is your GitHub repo name). Older docs used **`personal_finance_bot`** only as an example — use **`pwd`** / **`ls`** if you’re unsure.
+
+After cloning, **change into that project directory**:
 
 ```bash
-chmod +x start.sh   # if your shell does not already mark it executable
+cd cashbutler           # replace with your actual clone folder name
+chmod +x start.sh       # if your shell does not already mark it executable
 ./start.sh
 ```
 
@@ -120,7 +123,7 @@ python dev_run.py
 pkg update
 pkg install python git python-cryptography
 git clone <repo-url>
-cd personal_finance_bot
+cd cashbutler               # folder name follows the repo (often cashbutler, not personal_finance_bot)
 chmod +x start.sh
 ./start.sh
 ```
