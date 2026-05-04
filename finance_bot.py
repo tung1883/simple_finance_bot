@@ -55,17 +55,21 @@ def help_text():
     return """
 💰 Finance Bot
 
-You can:
-• Just type naturally:
-  - ăn 50k
-  - chơi game 100k
-  - lương 10 triệu
-• Or ask your finance coach anything:
-  - tôi nên tiết kiệm thế nào?
-  - give me a budget plan
-  - tôi chi tiêu có ổn không?
+📌 Quick add:
+• /add expense 50k ăn trưa
+• /add income 10tr lương
 
-Commands:
+📌 Natural input (AI auto):
+• ăn 50k
+• chơi game 100k
+• lương 10 triệu
+
+📌 Ask AI coach:
+• tôi nên tiết kiệm thế nào?
+• tôi chi tiêu có ổn không?
+
+📌 Commands:
+• /add → thêm chi tiêu nhanh
 • /summary → tổng thu chi
 • /history → giao dịch gần nhất
 • /reset_chat → xóa lịch sử hội thoại
@@ -345,6 +349,61 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text())
 
+# ---------------- MANUALLY ADD EXPENSE ------------
+def parse_add_command(text):
+    parts = text.split(" ", 3)
+
+    if len(parts) < 3:
+        return None
+
+    _, type_, amount_str = parts[:3]
+    category = parts[3] if len(parts) == 4 else "other"
+
+    amount_str = amount_str.lower().replace(",", "")
+
+    try:
+        if "k" in amount_str:
+            amount = float(amount_str.replace("k", "")) * 1000
+        elif "tr" in amount_str:
+            amount = float(amount_str.replace("tr", "")) * 1_000_000
+        else:
+            amount = float(amount_str)
+    except:
+        return None
+
+    return {
+        "type": type_,
+        "amount": amount,
+        "category": category
+    }
+
+
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    text = update.message.text
+
+    parsed = parse_add_command(text)
+
+    if not parsed:
+        await update.message.reply_text(
+            "❗ Sai format\n"
+            "Dùng:\n"
+            "/add expense 50k ăn trưa\n"
+            "/add income 10tr lương"
+        )
+        return
+
+    cursor.execute("""
+        INSERT INTO transactions (user_id, type, amount, category)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, parsed["type"], parsed["amount"], parsed["category"]))
+
+    conn.commit()
+
+    await update.message.reply_text(
+        f"✅ Added: {parsed['type']} {parsed['amount']:,.0f} ({parsed['category']})"
+    )
+
 # ---------------- RESET CHAT ----------------
 async def reset_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -465,6 +524,7 @@ def main():
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("reset_chat", reset_chat))
+    app.add_handler(CommandHandler("add", add_command))
 
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(
