@@ -15,7 +15,19 @@ fi
 PY="python3"
 command -v "$PY" >/dev/null 2>&1 || PY="python"
 
-if [ ! -d .venv ]; then
+ACTIVATE_UNIX=".venv/bin/activate"
+ACTIVATE_WIN=".venv/Scripts/activate"
+
+if [ ! -d .venv ]; then _mkvenv=1
+elif [ ! -f "$ACTIVATE_UNIX" ] && [ ! -f "$ACTIVATE_WIN" ]; then
+  echo "Removing incomplete .venv (missing activate script)."
+  rm -rf .venv
+  _mkvenv=1
+else
+  _mkvenv=0
+fi
+
+if [ "${_mkvenv:-0}" -eq 1 ]; then
   echo "Creating virtual env in .venv …"
   # Termux: cryptography (Rust) builds from pip fail — use pkg install python-cryptography + inherited site-packages.
   if [ -n "${TERMUX_VERSION:-}" ]; then
@@ -26,7 +38,17 @@ if [ ! -d .venv ]; then
 fi
 
 # shellcheck disable=SC1091
-source .venv/bin/activate
+if [ -f "$ACTIVATE_UNIX" ]; then
+  # shellcheck source=/dev/null
+  source "$ACTIVATE_UNIX"
+elif [ -f "$ACTIVATE_WIN" ]; then
+  # Git Bash / WSL-ish runs on Windows; venv puts activate under Scripts/.
+  source "$ACTIVATE_WIN"
+else
+  echo "No .venv activation script — venv creation may have failed. Try:"
+  echo "  rm -rf .venv && \"$PY\" -m venv .venv && ls -la .venv/"
+  exit 1
+fi
 
 pip install -q --upgrade pip setuptools wheel
 
