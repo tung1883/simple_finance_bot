@@ -1,3 +1,26 @@
 .env
 PLAN.md
 google-service-account.json
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+
+# Runtime DB
+finance.db
+finance.db-journal
+finance.db-wal
+finance.db-shm
+
+# IDE / agent state
+.claude/
+.idea/
+.vscode/
+
+# pytest
+.pytest_cache/
