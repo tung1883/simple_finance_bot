@@ -178,9 +178,17 @@ def prefetch_live_web_for_coach(
     except Exception as e:
         blob = f"(web_search error: {type(e).__name__}: {e})"
     return (
-        "\n\n=== LIVE WEB (prefetched — intent router set needs_live_web; REQUIRED: summarize in the "
-        "user's language with bullet points, source titles, and URLs from the text below. Do NOT reply "
-        "that you lack real-time data unless prefetch failed or returned no results.) ===\n"
+        "\n\n=== LIVE WEB (prefetched — this is your web_search result for this turn; do NOT call "
+        "web_search again). How to use it:\n"
+        "  1. If the snippets contain enough concrete content to answer (headlines, numbers, facts, "
+        "quotes), summarize them in the user's language with bullet points and cite source titles + URLs.\n"
+        "  2. If the snippets are too thin to answer (e.g. only news-site homepages, vague meta-descriptions, "
+        "no article-level detail) AND the user asked to summarize, analyze, or get details about a topic, "
+        "pick the SINGLE most relevant article-looking URL from the block below and call fetch_url on it "
+        "before answering. Do not fetch more than one URL. After the fetch_url result comes back, summarize "
+        "from that text and still cite the URL.\n"
+        "  3. Never reply that you lack real-time data unless the block below is empty or shows a prefetch "
+        "error.) ===\n"
         f"{blob}\n=== END LIVE WEB ===\n"
     )
 
