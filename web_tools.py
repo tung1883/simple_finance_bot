@@ -8,7 +8,8 @@ Env:
   WEB_SEARCH_ENABLED — default on; false/0/off disables search.
   WEB_SEARCH_MAX_RESULTS — default 5, max 15.
   WEB_SEARCH_TIMEOUT_SEC — default 25 (HTML fallback and overall search).
-  WEB_SEARCH_USER_AGENT — optional identity for HTML search POST.
+  WEB_SEARCH_USER_AGENT — optional override for HTML search POST (must look like a normal browser;
+    DuckDuckGo omits organic result markup for obvious bot identities).
   WEB_FETCH_ENABLED — default on; false disables fetch_url.
   WEB_FETCH_TIMEOUT_SEC — default 15.
   WEB_FETCH_MAX_BYTES — default 2_000_000 download cap.
@@ -23,6 +24,12 @@ from typing import Any, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+
+
+# DuckDuckGo serves a minimal HTML shell (no `.web-result` blocks) when the User-Agent looks like an
+# obvious bot/scraper identity. Defaults to a short common Windows desktop string known to receive
+# full organic markup; operators can override with WEB_SEARCH_USER_AGENT.
+_DDGS_HTML_DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -120,10 +127,7 @@ def _unwrap_ddg_redirect(href: str) -> str:
 def _ddg_html_text_results(query: str, max_results: int) -> List[dict[str, Any]]:
     """DuckDuckGo HTML endpoint + stdlib/regex parsing (no ddgs/primp)."""
     url = "https://html.duckduckgo.com/html/"
-    ua = os.getenv(
-        "WEB_SEARCH_USER_AGENT",
-        "Mozilla/5.0 (compatible; CashButlerFinanceBot/1.0; +https://github.com/)",
-    ).strip()
+    ua = (os.getenv("WEB_SEARCH_USER_AGENT") or "").strip() or _DDGS_HTML_DEFAULT_UA
     r = requests.post(
         url,
         data={"q": query, "b": ""},
