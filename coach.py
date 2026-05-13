@@ -16,6 +16,7 @@ from proxy import (
 )
 from recurring import format_recurring_lines, detect_recurring, format_forecast_block
 from review import build_monthly_review
+import web_tools
 from web_tools import run_fetch_url, run_web_search, web_search_enabled
 
 logger = logging.getLogger(__name__)
@@ -167,30 +168,54 @@ def prefetch_live_web_for_coach(
     needs_live_web: bool,
     web_search_query: Optional[str] = None,
 ) -> str:
-    """Inject web_search results when the intent router set needs_live_web (chat only)."""
+    """Inject web_search results (and a deterministically fetched article when the
+    snippets look too thin) into the coach prompt for needs_live_web turns.
+
+    The fetch decision is made in Python by `web_tools.auto_fetch_article`, not by the
+    LLM. The LIVE WEB block therefore doesn't instruct the model to call fetch_url —
+    when enrichment fires, the article text is already in the prompt as the primary
+    source. When it doesn't fire, the snippets are still useful as-is.
+    """
     if not needs_live_web or not web_search_enabled():
         return ""
     q = (web_search_query or "").strip() or (user_message or "").strip()[:220]
     if not q:
         return ""
+
     try:
-        blob = run_web_search(q)
+        results = web_tools.web_search_results(q)
     except Exception as e:
-        blob = f"(web_search error: {type(e).__name__}: {e})"
-    return (
-        "\n\n=== LIVE WEB (prefetched — this is your web_search result for this turn; do NOT call "
-        "web_search again). How to use it:\n"
-        "  1. If the snippets contain enough concrete content to answer (headlines, numbers, facts, "
-        "quotes), summarize them in the user's language with bullet points and cite source titles + URLs.\n"
-        "  2. If the snippets are too thin to answer (e.g. only news-site homepages, vague meta-descriptions, "
-        "no article-level detail) AND the user asked to summarize, analyze, or get details about a topic, "
-        "pick the SINGLE most relevant article-looking URL from the block below and call fetch_url on it "
-        "before answering. Do not fetch more than one URL. After the fetch_url result comes back, summarize "
-        "from that text and still cite the URL.\n"
-        "  3. Never reply that you lack real-time data unless the block below is empty or shows a prefetch "
-        "error.) ===\n"
-        f"{blob}\n=== END LIVE WEB ===\n"
+        return (
+            "\n\n=== LIVE WEB (prefetch failed) ===\n"
+            f"(web_search error: {type(e).__name__}: {e})\n=== END LIVE WEB ===\n"
+        )
+
+    if not results:
+        return (
+            "\n\n=== LIVE WEB (prefetched — no results) ===\n"
+            f"No web results returned for: {q}\n=== END LIVE WEB ===\n"
+        )
+
+    snippets_block = web_tools._format_search_lines(q, results)
+    enrichment = web_tools.auto_fetch_article(q, results, user_message or "")
+
+    header = (
+        "\n\n=== LIVE WEB (prefetched — this is your web_search result for this turn; "
+        "do NOT call web_search or fetch_url again unless the snippets and prefetched article "
+        "below are clearly insufficient. Cite source titles + URLs in your reply.) ===\n"
     )
+    body = (
+        "[SEARCH SNIPPETS — use for breadth and to cite additional URLs]\n"
+        f"{snippets_block}\n"
+    )
+    if enrichment:
+        fetched_url, fetched_text = enrichment
+        body += (
+            "\n[PREFETCHED ARTICLE — primary source for this turn; prefer this over the "
+            "snippets above when they conflict; still cite this URL]\n"
+            f"URL: {fetched_url}\n\n{fetched_text}\n"
+        )
+    return f"{header}{body}=== END LIVE WEB ===\n"
 
 
 def ai_chat(
